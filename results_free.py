@@ -888,6 +888,66 @@ def show_free_charts(df: pd.DataFrame):
     
     st.markdown("---")
     
+    # NEW: Events & PYOP offerings
+    if "offers_events" in df.columns:
+        st.subheader("🎉 Events & Parties")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # What % of studios offer events
+            def _to_bool01(s):
+                if s.dtype == 'bool':
+                    return s.astype(int)
+                s = s.astype(str).str.strip().str.lower()
+                mapping = {
+                    "yes": 1, "y": 1, "true": 1, "t": 1, "1": 1,
+                    "no": 0,  "n": 0, "false": 0, "f": 0, "0": 0
+                }
+                return s.map(mapping)
+            
+            events01 = _to_bool01(df["offers_events"])
+            denom = events01.notna().sum() if events01.notna().any() else len(df)
+            if denom > 0:
+                pct_with_events = (events01.fillna(0).sum() / denom) * 100
+                st.metric("Studios Offering Events", f"{pct_with_events:.0f}%")
+        
+        with col2:
+            # Average events per month for studios that offer them
+            df_events = df[(df["offers_events"].astype(str).str.lower().isin(['true', '1', 'yes'])) & 
+                          (df["events_per_month"].notna())]
+            if len(df_events) > 0:
+                df_events["events_per_month"] = pd.to_numeric(df_events["events_per_month"], errors="coerce")
+                avg_events = df_events["events_per_month"].mean()
+                st.metric("Avg Events/Month", f"{avg_events:.1f}")
+        
+        # Event pricing distribution
+        if "event_price" in df.columns:
+            df_event_price = df[df["event_price"].notna()].copy()
+            df_event_price["event_price"] = pd.to_numeric(df_event_price["event_price"], errors="coerce")
+            df_event_price = df_event_price[df_event_price["event_price"].notna()]
+            
+            if len(df_event_price) > 0:
+                st.write("**Event Pricing Distribution**")
+                
+                chart = alt.Chart(df_event_price).mark_bar().encode(
+                    x=alt.X("event_price:Q", bin=alt.Bin(step=10), 
+                           title="Price per Person ($)"),
+                    y=alt.Y("count()", title="Number of Studios")
+                ).properties(height=250)
+                
+                st.altair_chart(chart, use_container_width=True)
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Min", f"${df_event_price['event_price'].min():.0f}")
+                with col2:
+                    st.metric("Median", f"${df_event_price['event_price'].median():.0f}")
+                with col3:
+                    st.metric("Max", f"${df_event_price['event_price'].max():.0f}")
+    
+    
+    
     # Build-out costs
     if "buildout_cost_total" in df.columns:
         st.subheader("🔨 Build-Out Investment")
