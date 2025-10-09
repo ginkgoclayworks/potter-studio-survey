@@ -281,13 +281,60 @@ def get_all_columns():
         "_sheet_row"
     ]
 
+def check_for_existing_response(response_id):
+    """
+    Check if a response_id already exists in the sheet.
+    Returns: (exists: bool, row_number: int or None)
+    """
+    try:
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        service = build('sheets', 'v4', credentials=credentials)
+        sheet_id = st.secrets["sheet_id"]
+        
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range="Sheet1"
+        ).execute()
+        
+        values = result.get('values', [])
+        if len(values) < 2:
+            return False, None
+            
+        headers = values[0]
+        rows = values[1:]
+        
+        response_id_col = headers.index('response_id') if 'response_id' in headers else None
+        if response_id_col is None:
+            return False, None
+            
+        for idx, row in enumerate(rows, start=2):  # Start at 2 (row 1 is header)
+            if len(row) > response_id_col and row[response_id_col] == response_id:
+                return True, idx
+        
+        return False, None
+        
+    except Exception as e:
+        st.warning(f"Could not check for duplicates: {e}")
+        return False, None
 
 def save_response(data):
+    """
+    Save or update response with duplicate prevention.
     
-    # Only add response_id if it doesn't exist
+    Strategy:
+    1. Check if response_id already exists
+    2. If exists, update that row
+    3. If not, append new row
+    """
+    
+    # Ensure response_id exists
     if 'response_id' not in data:
         data['response_id'] = str(uuid.uuid4())
     
+    # Add metadata
     data = {
         "schema_version": "v1.1",
         "submitted_at": datetime.now().isoformat(),
@@ -298,8 +345,6 @@ def save_response(data):
     columns = get_all_columns()
 
     try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
         credentials = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"],
             scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -307,6 +352,22 @@ def save_response(data):
         service = build('sheets', 'v4', credentials=credentials)
         sheet_id = st.secrets["sheet_id"]
 
+        # Check if this response_id already exists
+        exists, row_number = check_for_existing_response(data['response_id'])
+        
+        if exists and row_number:
+            # UPDATE existing row
+            st.info(f"Updating existing response (found at row {row_number})")
+            body_row = {'values': [[flat.get(c, "") for c in columns]]}
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=f"Sheet1!A{row_number}",
+                valueInputOption='RAW',
+                body=body_row
+            ).execute()
+            return True
+        
+        # NEW submission - check if sheet is empty and add header if needed
         result = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
             range="Sheet1!A1:A1"
@@ -324,6 +385,7 @@ def save_response(data):
                 body=header_body
             ).execute()
         
+        # APPEND new row
         body_row = {'values': [[flat.get(c, "") for c in columns]]}
         service.spreadsheets().values().append(
             spreadsheetId=sheet_id,
@@ -335,16 +397,32 @@ def save_response(data):
         return True
         
     except Exception as e:
+        # Fallback to CSV with duplicate checking
         import csv, os
         path = "survey_responses.csv"
+        
+        # Check local CSV for duplicates
+        existing_ids = set()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_ids = {row.get('response_id') for row in reader if row.get('response_id')}
+        
+        if data['response_id'] in existing_ids:
+            st.warning(f"Response ID already exists in local backup. Skipping save to prevent duplicate.")
+            return False
+        
+        # Append to CSV
         new_file = not os.path.exists(path)
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=columns)
             if new_file:
                 w.writeheader()
             w.writerow(flat)
+        
         st.warning(f"Saved locally to survey_responses.csv. Error with Sheets: {str(e)}")
         return True
+
     
 def load_response_by_id(response_id):
     """Load a specific response by ID from sheets"""
@@ -2430,9 +2508,15 @@ def render_results():
 #         else:
 #             st.error("Failed to update response. Please try again.")
 #     else:
-#         # New submission - generate response_id first
-#         response_id = str(uuid.uuid4())
-#         data['response_id'] = response_id
+#         # New submission - response_id already generated in render_survey()
+#         # Just use the existing one
+#         response_id = data.get('response_id')
+        
+#         # Safety check: if somehow response_id doesn't exist, generate it
+#         if not response_id:
+#             response_id = str(uuid.uuid4())
+#             data['response_id'] = response_id
+#             data['studio_name'] = response_id[:4].upper()
         
 #         if save_response(data):
 #             st.success("Survey submitted!")
@@ -2450,7 +2534,11 @@ def render_results():
 #             if st.button("View Results Dashboard", type="primary"):
 #                 st.session_state.page = 'results'
 #                 st.rerun()
+
 def submit_survey():
+    """
+    Enhanced submit with better duplicate prevention messaging
+    """
     data = st.session_state.survey_data
     
     required_fields = {
@@ -2476,56 +2564,37 @@ def submit_survey():
     # Check if this is an update or new submission
     is_update = st.session_state.get('is_update', False)
     
-    if is_update and data.get('_sheet_row'):
-        # Update existing response
-        if update_response(data):
-            response_id = data.get('response_id')  # Already exists from previous submission
-            st.success("Survey updated successfully!")
-            st.balloons()
-            
-            st.info(f"""
-            **Your Response ID:** `{response_id}`
-            
-            Your response has been updated. Keep this ID if you need to make future updates.
-            """)
-            
-            st.code(response_id, language=None)
-            
-            # Clear the update flag
+    # For new submissions, response_id already generated in render_survey()
+    response_id = data.get('response_id')
+    
+    # Safety check
+    if not response_id:
+        response_id = str(uuid.uuid4())
+        data['response_id'] = response_id
+        data['studio_name'] = response_id[:4].upper()
+    
+    # Save (function will handle update vs new internally)
+    if save_response(data):
+        st.success("Survey submitted successfully!" if not is_update else "Survey updated successfully!")
+        st.balloons()
+        
+        st.info(f"""
+        **Your Response ID:** `{response_id}`
+        
+        {"Your response has been updated." if is_update else "**Important:** Save this ID! You can use it to update your responses later as your studio evolves."}
+        """)
+        
+        st.code(response_id, language=None)
+        
+        # Clear the update flag
+        if is_update:
             st.session_state.is_update = False
-            
-            if st.button("View Results Dashboard", type="primary"):
-                st.session_state.page = 'results'
-                st.rerun()
-        else:
-            st.error("Failed to update response. Please try again.")
+        
+        if st.button("View Results Dashboard", type="primary"):
+            st.session_state.page = 'results'
+            st.rerun()
     else:
-        # New submission - response_id already generated in render_survey()
-        # Just use the existing one
-        response_id = data.get('response_id')
-        
-        # Safety check: if somehow response_id doesn't exist, generate it
-        if not response_id:
-            response_id = str(uuid.uuid4())
-            data['response_id'] = response_id
-            data['studio_name'] = response_id[:4].upper()
-        
-        if save_response(data):
-            st.success("Survey submitted!")
-            st.balloons()
-            
-            st.info(f"""
-            **Your Response ID:** `{response_id}`
-            
-            **Important:** Save this ID! You can use it to update your responses later as your studio evolves.
-            """)
-            
-            # Show copyable code block
-            st.code(response_id, language=None)
-            
-            if st.button("View Results Dashboard", type="primary"):
-                st.session_state.page = 'results'
-                st.rerun()
+        st.error("Failed to save response. Please try again or contact support.")
 
 def main():
     with st.sidebar:
